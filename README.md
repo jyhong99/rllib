@@ -1,165 +1,91 @@
-# RL Algorithms
+# `rllib/model_free`
 
-A modular and research-oriented implementation of model-free reinforcement learning algorithms in PyTorch.
+Modular model-free reinforcement learning library with:
 
-This repository provides clean, reusable, and extensible implementations of modern RL algorithms with a consistent architecture, designed for:
+- value-based, policy-based, and offline baselines
+- reusable common stack (buffers, networks, policies, trainers, callbacks, loggers)
+- single-env and Ray multi-worker training support
 
-- reinforcement learning research
-- algorithm prototyping
-- benchmarking and experimentation
-- integration into real-world optimization systems (e.g., circuit optimization, control)
-
----
-
-## Features
-
-- Unified and modular design across algorithms
-- Support for both on-policy and off-policy methods
-- Continuous and discrete action spaces
-- Reusable training pipeline
-- Scalable training support (optional Ray integration)
-- Designed for research clarity and extensibility
+This folder is designed so algorithms share the same training/runtime infrastructure while keeping each baseline implementation separate and readable.
 
 ---
 
-## Implemented Algorithms
+## Structure
 
-### Policy Gradient (On-Policy)
-
-- PPO (Proximal Policy Optimization)
-- TRPO (Trust Region Policy Optimization)
-- VPG (Vanilla Policy Gradient)
-- A2C (Advantage Actor-Critic)
-- ACKTR (Kronecker-Factored Trust Region)
-
-Discrete variants available for:
-
-- PPO (Discrete)
-- VPG (Discrete)
-- A2C (Discrete)
-
----
-
-### Actor-Critic (Off-Policy)
-
-- SAC (Soft Actor-Critic)
-- TD3 (Twin Delayed DDPG)
-- DDPG (Deep Deterministic Policy Gradient)
-- TQC (Truncated Quantile Critics)
-- REDQ (Randomized Ensemble Double Q-learning)
-- ACER (Actor-Critic with Experience Replay)
-
-Discrete variant available for:
-
-- SAC (Discrete)
-
----
-
-### Value-Based
-
-- DQN (Deep Q-Network)
-- QR-DQN (Quantile Regression DQN)
-- Rainbow DQN
-
----
-
-## Repository Structure
-
-```
-rl_algorithms/
-│
-├── model_free/
-│   ├── baselines/
-│   │   ├── policy_gradients/
-│   │   │   ├── on_policy/
-│   │   │   │   ├── ppo/
-│   │   │   │   ├── trpo/
-│   │   │   │   ├── vpg/
-│   │   │   │   ├── a2c/
-│   │   │   │   └── acktr/
-│   │   │   │
-│   │   │   └── off_policy/
-│   │   │       ├── sac/
-│   │   │       ├── td3/
-│   │   │       ├── ddpg/
-│   │   │       ├── tqc/
-│   │   │       ├── redq/
-│   │   │       └── acer/
-│   │   │
-│   │   └── value_based/
-│   │       ├── dqn/
-│   │       ├── qrdqn/
-│   │       └── rainbow/
-│   │
-│   ├── common/
-│   │   ├── buffers/
-│   │   ├── networks/
-│   │   ├── policies/
-│   │   ├── trainers/
-│   │   ├── callbacks/
-│   │   ├── loggers/
-│   │   ├── noises/
-│   │   ├── optimizers/
-│   │   ├── wrappers/
-│   │   └── utils/
-│   │
-│   └── tests/
-│
-└── README.md
+```text
+model_free/
+├─ baselines/
+│  ├─ value_based/        # DQN family + distributional variants
+│  ├─ policy_based/       # on-policy + off-policy actor(-critic) methods
+│  └─ offline/            # offline RL algorithms
+└─ common/
+   ├─ buffers/            # replay/rollout/PER/HER
+   ├─ networks/           # policy/value/Q/distribution modules
+   ├─ policies/           # on-policy/off-policy drivers + core abstractions
+   ├─ trainers/           # Trainer + builder + train loops (single/Ray)
+   ├─ callbacks/          # eval/checkpoint/early-stop/etc.
+   ├─ loggers/            # CSV/JSONL/TB/W&B/stdout + transition logger
+   ├─ wrappers/           # Atari + normalization wrappers
+   ├─ optimizers/         # optimizer/scheduler builders (+ KFAC/Lion)
+   ├─ noises/             # exploration noise builders
+   └─ utils/              # shared utility helpers
 ```
 
 ---
 
-## Installation
+## Included Baselines
 
-Clone the repository:
+### Value-based
+- `dqn`, `drqn`, `c51`, `qrdqn`, `iqn`, `fqf`, `rainbow`
 
-```bash
-git clone https://github.com/jyhong99/rl_algorithms.git
-cd rl_algorithms
-```
+### Policy-based Off-policy
+- `ddpg`, `td3`, `sac`, `sac_discrete`, `tqc`, `redq`, `acer`
 
-Set Python path:
+### Policy-based On-policy
+- `a2c`, `a2c_discrete`, `ppo`, `ppo_discrete`, `trpo`, `vpg`, `vpg_discrete`, `acktr`
 
-```bash
-export PYTHONPATH="$PWD:$PYTHONPATH"
-```
-
-Install dependencies:
-
-```bash
-pip install torch numpy
-```
-
-Optional:
-
-```bash
-pip install gymnasium
-pip install ray
-```
+### Offline
+- `cql`, `iql`, `td3bc`
 
 ---
 
-## Example Usage
+## Quick Start
+
+### 1) Build an algorithm
 
 ```python
-import gymnasium as gym
+from rllib.model_free.baselines.policy_based.on_policy.ppo import ppo
 
-from model_free.baselines.policy_gradients.off_policy.sac import sac
-from model_free.common.trainers.trainer_builder import build_trainer
+algo = ppo(
+    obs_dim=24,
+    action_dim=4,
+    device="cpu",
+)
+```
+
+### 2) Build a trainer
+
+```python
+from rllib.model_free.common.trainers import build_trainer
+import gymnasium as gym
 
 def make_env():
     return gym.make("Pendulum-v1")
 
-algo = sac(
-    obs_dim=3,
-    action_dim=1,
-)
-
 trainer = build_trainer(
     make_train_env=make_env,
+    make_eval_env=make_env,
     algo=algo,
-    total_env_steps=200000,
+    total_env_steps=200_000,
+    seed=42,
+
+    # logging
+    enable_logger=True,
+    logger_log_dir="./runs",
+    logger_exp_name="ppo_pendulum",
+
+    # transition logger toggle (trainer-level)
+    enable_transition_log=False,  # set True to write transitions.jsonl
 )
 
 trainer.train()
@@ -167,26 +93,71 @@ trainer.train()
 
 ---
 
-## Applications
+## Trainer Notes
 
-- continuous control
-- robotics
-- circuit optimization
-- engineering optimization
-- EDA systems
-
----
-
-## Author
-
-Junyoung Hong  
-M.S. Student, AI Semiconductor Engineering  
-Hanyang University  
-
-GitHub: https://github.com/jyhong99
+- `build_trainer(...)` is the easiest entry point for production training runs.
+- Supports:
+  - single-env loop (`n_envs=1`)
+  - Ray rollout workers (`n_envs>1`, with optional policy/env factories)
+- Transition logging is controlled at trainer construction:
+  - `enable_transition_log`
+  - `transition_log_filename`
+  - `transition_log_flush_every`
 
 ---
 
-## License
+## Logging and Callbacks
 
-MIT License
+### Logger backends
+- TensorBoard
+- CSV
+- JSONL
+- W&B
+- stdout
+- transition JSONL (`common/loggers/transition_logger.py`)
+
+### Common callbacks
+- evaluation
+- checkpointing
+- best model saving
+- early stopping
+- NaN guard
+- timing / LR / grad-norm logging
+- Ray reporting callbacks (optional)
+
+---
+
+## Optional Features
+
+- **Normalize wrapper**: observation/reward normalization + action handling
+- **Atari wrapper**: frame stack/skip, preprocessing, reward clipping
+- **Replay variants**:
+  - uniform replay
+  - PER
+  - HER
+  - sequence replay support for recurrent methods
+
+---
+
+## Practical Import Paths
+
+- Trainers:
+  - `from rllib.model_free.common.trainers import Trainer, build_trainer`
+- Loggers:
+  - `from rllib.model_free.common.loggers import build_logger`
+- Callbacks:
+  - `from rllib.model_free.common.callbacks import build_callbacks`
+- Example baseline:
+  - `from rllib.model_free.baselines.value_based.dqn import dqn`
+
+---
+
+## Development Tips
+
+- Add new algorithms by composing:
+  1. `Head` (networks/inference),
+  2. `Core` (update/loss),
+  3. policy driver (`OnPolicyAlgorithm` or `OffPolicyAlgorithm`),
+  4. trainer wiring via `build_trainer(...)`.
+- Keep algorithm-specific logic in `baselines/*` and shared logic in `common/*`.
+
