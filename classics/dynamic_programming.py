@@ -106,7 +106,7 @@ def build_tabular_mdp_from_env(
 
     The env is expected to expose ``observation_space.n``, ``action_space.n``,
     ``state_dict()``, and ``load_state_dict(...)``. This matches the tabular
-    grid environments in ``env/tabular_grid.py``.
+    grid environments in ``classics/toy_env/tabular_grid.py``.
 
     Parameters
     ----------
