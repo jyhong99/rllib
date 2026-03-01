@@ -1,0 +1,581 @@
+"""Buffer and segment-tree helper utilities for replay-based RL.
+
+This module provides standalone numerical helpers for rollout/replay processing,
+including GAE computation, sampling-index utilities, and segment-tree data
+structures used by prioritized replay implementations.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Optional
+import operator
+
+import numpy as np
+
+
+# =============================================================================
+# GAE utility
+# =============================================================================
+def _compute_gae(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    dones: np.ndarray,
+    *,
+    last_value: float,
+    last_done: bool,
+    gamma: float,
+    gae_lambda: float,
+) -> np.ndarray:
+    """
+    Compute Generalized Advantage Estimation (GAE-λ) over a single rollout.
+
+    This function assumes a *single* contiguous trajectory of length T. The inputs
+    correspond to time steps t = 0..T-1.
+
+    Parameters
+    ----------
+    rewards : np.ndarray, shape (T,)
+        Reward sequence :math:`r_t`.
+    values : np.ndarray, shape (T,)
+        State-value estimates :math:`V(s_t)` for each time step.
+    dones : np.ndarray, shape (T,)
+        Terminal flags after each transition.
+        Convention: ``dones[t] == 1`` means the episode terminated *after* step t,
+        i.e., the next state :math:`s_{t+1}` is terminal (or invalid for bootstrapping).
+    last_value : float
+        Bootstrap value :math:`V(s_T)` used only for the boundary when ``t = T-1``
+        and ``last_done`` is False (rollout truncated by time limit / buffer cutoff).
+        If ``last_done`` is True, bootstrap is ignored and treated as 0.
+    last_done : bool
+        Whether the rollout ended with a terminal transition at the last step.
+    gamma : float
+        Discount factor :math:`\\gamma \\in [0, 1]`.
+    gae_lambda : float
+        GAE smoothing parameter :math:`\\lambda \\in [0, 1]`.
+
+    Returns
+    -------
+    advantages : np.ndarray, shape (T,)
+        Advantage estimates :math:`A_t` computed via backward recursion.
+
+    Notes
+    -----
+    Implements GAE from:
+        Schulman et al., "High-Dimensional Continuous Control Using GAE", 2016.
+
+    The temporal-difference residual (with termination masking) is:
+
+    .. math::
+        \\delta_t = r_t + \\gamma (1 - d_t) V_{t+1} - V_t
+
+    and the advantage recursion is:
+
+    .. math::
+        A_t = \\delta_t + \\gamma \\lambda (1 - d_t) A_{t+1}
+
+    where :math:`d_t` corresponds to ``dones[t]``.
+    """
+    rewards = np.asarray(rewards, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32)
+    dones = np.asarray(dones, dtype=np.float32)
+
+    if rewards.ndim != 1:
+        raise ValueError(f"rewards must be 1D (T,), got shape={rewards.shape}")
+    if values.ndim != 1:
+        raise ValueError(f"values must be 1D (T,), got shape={values.shape}")
+    if dones.ndim != 1:
+        raise ValueError(f"dones must be 1D (T,), got shape={dones.shape}")
+    if rewards.shape[0] != values.shape[0] or rewards.shape[0] != dones.shape[0]:
+        raise ValueError(
+            f"Shape mismatch: rewards={rewards.shape}, values={values.shape}, dones={dones.shape}"
+        )
+    if not (0.0 <= gamma <= 1.0):
+        raise ValueError(f"gamma must be in [0, 1], got {gamma}")
+    if not (0.0 <= gae_lambda <= 1.0):
+        raise ValueError(f"gae_lambda must be in [0, 1], got {gae_lambda}")
+
+    T = int(rewards.shape[0])
+    advantages = np.zeros((T,), dtype=np.float32)
+
+    # Boundary bootstrap for V(s_T): used only if rollout did not terminate.
+    bootstrap_v = 0.0 if bool(last_done) else float(last_value)
+
+    gae: float = 0.0
+    for t in reversed(range(T)):
+        # If done at t, the next state is terminal -> no bootstrapping, no future GAE.
+        nonterminal = 1.0 - float(dones[t])
+
+        # For t==T-1, we use last_value (or 0 if last_done); otherwise values[t+1].
+        v_next = bootstrap_v if (t == T - 1) else float(values[t + 1])
+
+        delta = float(rewards[t]) + gamma * nonterminal * v_next - float(values[t])
+        gae = delta + gamma * gae_lambda * nonterminal * gae
+        advantages[t] = gae
+
+    return advantages
+
+
+# =============================================================================
+# Sampling helpers
+# =============================================================================
+def _uniform_indices(size: int, batch_size: int) -> np.ndarray:
+    """
+    Draw uniform random indices in ``[0, size)``.
+
+    Parameters
+    ----------
+    size : int
+        Number of valid items in the buffer (logical size).
+    batch_size : int
+        Number of indices to sample.
+
+    Returns
+    -------
+    idx : np.ndarray, shape (batch_size,)
+        Sampled indices (dtype int64).
+
+    Raises
+    ------
+    ValueError
+        If ``batch_size <= 0``.
+    RuntimeError
+        If ``size <= 0`` (empty buffer).
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if size <= 0:
+        raise RuntimeError("Cannot sample from an empty buffer.")
+    return np.random.randint(0, int(size), size=int(batch_size), dtype=np.int64)
+
+
+def _stratified_prefixsum_indices(
+    *,
+    sum_tree: Any,
+    total_p: float,
+    size: int,
+    batch_size: int,
+) -> np.ndarray:
+    """
+    Stratified prefix-sum sampling using a sum segment tree (PER).
+
+    This performs stratified sampling over the interval ``[0, total_p)`` by dividing
+    it into ``batch_size`` equal-length strata, sampling one value uniformly from
+    each stratum, and mapping that value to an index via ``sum_tree.retrieve(s)``.
+
+    Parameters
+    ----------
+    sum_tree : Any
+        SumSegmentTree-like object providing:
+          - ``retrieve(s: float) -> int`` returning a leaf index in ``[0, capacity)``
+          - optional ``__getitem__`` used elsewhere for probability/weight computation
+    total_p : float
+        Total priority mass (typically ``sum_tree.sum(0, size)``).
+    size : int
+        Logical buffer size (valid range of indices is ``[0, size)``).
+        Note: ``size`` may be smaller than the tree capacity.
+    batch_size : int
+        Number of indices to sample.
+
+    Returns
+    -------
+    idx : np.ndarray, shape (batch_size,)
+        Stratified-sampled indices (dtype int64).
+
+    Notes
+    -----
+    Common PER implementation detail:
+      When the segment tree capacity is larger than the current buffer size,
+      unused leaves contain 0 priority. Some ``retrieve`` implementations can
+      return indices in the padded region (``>= size``). We reject and resample
+      in that case.
+
+    Raises
+    ------
+    ValueError
+        If ``batch_size <= 0``.
+    RuntimeError
+        If ``size <= 0`` or ``total_p <= 0``.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if size <= 0:
+        raise RuntimeError("Cannot sample from an empty buffer.")
+    if total_p <= 0.0:
+        raise RuntimeError("total_p must be positive for stratified sampling.")
+
+    B = int(batch_size)
+    seg = float(total_p) / float(B)
+    idx = np.empty((B,), dtype=np.int64)
+
+    for i in range(B):
+        a = seg * i
+        b = seg * (i + 1)
+        s = float(np.random.uniform(a, b))
+
+        j = int(sum_tree.retrieve(s))
+        while j >= size:
+            # Fallback: sample anywhere in [0, total_p) until valid.
+            s = float(np.random.uniform(0.0, total_p))
+            j = int(sum_tree.retrieve(s))
+
+        idx[i] = j
+
+    return idx
+
+
+# =============================================================================
+# Segment tree utilities (PER)
+# =============================================================================
+def _is_power_of_two(n: int) -> bool:
+    """
+    Return True iff ``n`` is a positive power of two: 1, 2, 4, 8, ...
+
+    Parameters
+    ----------
+    n : int
+        Integer to test.
+
+    Returns
+    -------
+    is_pow2 : bool
+        True if ``n`` is a power of two and ``n > 0``.
+    """
+    return (n > 0) and ((n & (n - 1)) == 0)
+
+
+def _next_power_of_two(n: int) -> int:
+    """
+    Return the smallest power-of-two integer >= ``n``.
+
+    Parameters
+    ----------
+    n : int
+        Target integer.
+
+    Returns
+    -------
+    p : int
+        Smallest power of two >= n. For n <= 1, returns 1.
+
+    Examples
+    --------
+    >>> _next_power_of_two(1)
+    1
+    >>> _next_power_of_two(5)
+    8
+    """
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+class SegmentTree:
+    """
+    Generic segment tree supporting range aggregation and point updates.
+
+    This is a classic full binary tree stored in an array. It supports an
+    associative binary operation over a fixed number of leaves (capacity).
+    Typical PER usage:
+      - Sum tree (prefix-sum sampling)
+      - Min tree (min-priority for IS normalization)
+
+    Parameters
+    ----------
+    capacity : int
+        Number of leaves. Must be a positive power of two.
+    operation : Callable[[float, float], float]
+        Associative binary operation (e.g., sum, min).
+    init_value : float
+        Initial fill value for all nodes.
+
+    Attributes
+    ----------
+    capacity : int
+        Number of leaves (power-of-two).
+    operation : Callable[[float, float], float]
+        Aggregation operator.
+    tree : list[float]
+        Flat array representation of the tree of length ``2*capacity``.
+        Index 0 is unused; root is at index 1.
+
+    Notes
+    -----
+    Layout (1-indexed internal nodes, array-backed):
+      - Root: index 1
+      - Internal nodes: [1, capacity)
+      - Leaves: [capacity, 2*capacity)
+
+    Leaves store values for indices [0, capacity) at positions [capacity+idx].
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        operation: Callable[[float, float], float],
+        init_value: float,
+    ) -> None:
+        """Initialize a generic segment tree.
+
+        Parameters
+        ----------
+        capacity : int
+            Number of leaves. Must be a positive power of two.
+        operation : Callable[[float, float], float]
+            Associative binary aggregation operator.
+        init_value : float
+            Initial value used to fill all nodes.
+
+        Raises
+        ------
+        ValueError
+            If ``capacity`` is not positive or not a power of two.
+        """
+        if capacity <= 0:
+            raise ValueError(f"capacity must be positive, got {capacity}")
+        if not _is_power_of_two(capacity):
+            raise ValueError(
+                f"capacity must be a power of two, got {capacity}. "
+                "Use _next_power_of_two(...) to round up."
+            )
+
+        self.capacity = int(capacity)
+        self.operation = operation
+        self.tree = [float(init_value) for _ in range(2 * self.capacity)]
+
+    def _operate_inclusive(
+        self,
+        start: int,
+        end: int,
+        node: int,
+        node_start: int,
+        node_end: int,
+    ) -> float:
+        """
+        Internal recursive range aggregation on an *inclusive* interval.
+
+        Parameters
+        ----------
+        start, end : int
+            Query interval [start, end], inclusive.
+        node : int
+            Current tree node index in the array representation.
+        node_start, node_end : int
+            Interval covered by `node`, inclusive.
+
+        Returns
+        -------
+        out : float
+            Aggregated value over [start, end].
+        """
+        if start == node_start and end == node_end:
+            return self.tree[node]
+
+        mid = (node_start + node_end) // 2
+        if end <= mid:
+            return self._operate_inclusive(start, end, 2 * node, node_start, mid)
+        if start > mid:
+            return self._operate_inclusive(start, end, 2 * node + 1, mid + 1, node_end)
+
+        left_val = self._operate_inclusive(start, mid, 2 * node, node_start, mid)
+        right_val = self._operate_inclusive(mid + 1, end, 2 * node + 1, mid + 1, node_end)
+        return self.operation(left_val, right_val)
+
+    def operate(self, start: int = 0, end: Optional[int] = None) -> float:
+        """
+        Aggregate values over the half-open interval ``[start, end)``.
+
+        Parameters
+        ----------
+        start : int, default=0
+            Start index (inclusive).
+        end : int or None, default=None
+            End index (exclusive). If None, uses ``capacity``.
+
+        Returns
+        -------
+        result : float
+            Aggregated value over ``[start, end)``.
+
+        Raises
+        ------
+        IndexError
+            If indices are out of bounds.
+        ValueError
+            If ``start >= end``.
+        """
+        if end is None:
+            end = self.capacity
+
+        if not (0 <= start < self.capacity):
+            raise IndexError(f"start out of range: {start}")
+        if not (0 < end <= self.capacity):
+            raise IndexError(f"end out of range: {end}")
+        if start >= end:
+            raise ValueError(f"Invalid range: start={start} must be < end={end}")
+
+        # Convert half-open [start, end) -> inclusive [start, end-1] for recursion.
+        return self._operate_inclusive(start, end - 1, 1, 0, self.capacity - 1)
+
+    def __setitem__(self, idx: int, val: float) -> None:
+        """
+        Point-update a leaf value and refresh ancestors up to the root.
+
+        Parameters
+        ----------
+        idx : int
+            Leaf index in ``[0, capacity)``.
+        val : float
+            New leaf value.
+        """
+        if not (0 <= idx < self.capacity):
+            raise IndexError(f"idx out of range: {idx}")
+
+        i = idx + self.capacity
+        self.tree[i] = float(val)
+
+        i //= 2
+        while i >= 1:
+            self.tree[i] = self.operation(self.tree[2 * i], self.tree[2 * i + 1])
+            i //= 2
+
+    def __getitem__(self, idx: int) -> float:
+        """
+        Read a leaf value.
+
+        Parameters
+        ----------
+        idx : int
+            Leaf index in ``[0, capacity)``.
+
+        Returns
+        -------
+        val : float
+            Leaf value stored at ``idx``.
+        """
+        if not (0 <= idx < self.capacity):
+            raise IndexError(f"idx out of range: {idx}")
+        return float(self.tree[self.capacity + idx])
+
+
+class SumSegmentTree(SegmentTree):
+    """
+    Segment tree with sum aggregation (PER prefix-sum sampling).
+
+    Each leaf stores a non-negative priority mass (typically ``p_i^alpha``).
+    """
+
+    def __init__(self, capacity: int) -> None:
+        """Initialize a sum segment tree.
+
+        Parameters
+        ----------
+        capacity : int
+            Number of leaves. Must be a positive power of two.
+        """
+        super().__init__(capacity=capacity, operation=operator.add, init_value=0.0)
+
+    def sum(self, start: int = 0, end: Optional[int] = None) -> float:
+        """
+        Compute sum over ``[start, end)``.
+
+        Parameters
+        ----------
+        start : int, default=0
+            Start index (inclusive).
+        end : int or None, default=None
+            End index (exclusive). If None, uses ``capacity``.
+
+        Returns
+        -------
+        s : float
+            Sum of leaf values over the interval.
+        """
+        return super().operate(start, end)
+
+    def retrieve(self, upperbound: float) -> int:
+        """
+        Find the smallest leaf index whose prefix-sum exceeds ``upperbound``.
+
+        More precisely, returns the smallest index ``i`` such that:
+
+        .. math::
+            \\sum_{k=0}^{i} p_k > \\text{upperbound}
+
+        Parameters
+        ----------
+        upperbound : float
+            Threshold in ``[0, total_sum)`` where ``total_sum = tree[1]``.
+
+        Returns
+        -------
+        idx : int
+            Leaf index in ``[0, capacity)``.
+
+        Raises
+        ------
+        ValueError
+            If ``total_sum <= 0`` or ``upperbound`` is out of range.
+
+        Notes
+        -----
+        This is the standard mapping used in proportional PER sampling:
+        sample ``s ~ Uniform(0, total_sum)`` and return ``retrieve(s)``.
+        """
+        total = float(self.tree[1])
+        if total <= 0.0:
+            raise ValueError("Cannot retrieve from an empty/non-positive sum tree.")
+        if not (0.0 <= float(upperbound) < total):
+            raise ValueError(
+                f"upperbound must be in [0, total_sum), got {upperbound} with total_sum={total}"
+            )
+
+        idx = 1
+        ub = float(upperbound)
+        while idx < self.capacity:
+            left = 2 * idx
+            if self.tree[left] > ub:
+                idx = left
+            else:
+                ub -= self.tree[left]
+                idx = left + 1
+
+        return idx - self.capacity
+
+
+class MinSegmentTree(SegmentTree):
+    """
+    Segment tree with min aggregation (PER min-priority / IS normalization).
+
+    Each leaf typically stores the same priority mass as the sum tree so that:
+
+      - ``min_tree.min(0, size)`` gives the minimum priority in the valid buffer.
+      - This helps compute ``p_min`` for importance-sampling weight normalization.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        """Initialize a min segment tree.
+
+        Parameters
+        ----------
+        capacity : int
+            Number of leaves. Must be a positive power of two.
+        """
+        super().__init__(capacity=capacity, operation=min, init_value=float("inf"))
+
+    def min(self, start: int = 0, end: Optional[int] = None) -> float:
+        """
+        Compute min over ``[start, end)``.
+
+        Parameters
+        ----------
+        start : int, default=0
+            Start index (inclusive).
+        end : int or None, default=None
+            End index (exclusive). If None, uses ``capacity``.
+
+        Returns
+        -------
+        m : float
+            Minimum leaf value over the interval.
+        """
+        return super().operate(start, end)
